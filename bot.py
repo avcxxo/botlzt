@@ -1,261 +1,242 @@
-import asyncio
-import logging
+import requests
+import re
 import time
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from sqlite3 import connect
-from urllib.parse import urlparse
-import aiohttp
+import pytz
+import logging
+from datetime import datetime, timedelta
+from threading import Thread, Lock
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
+
+# Настройка логгера
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # Конфигурация
-API_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
-LZT_API_KEY = 'YOUR_LZT_API_KEY'
-ALLOWED_USER_ID = 123456789  # Ваш Telegram ID
+API_KEY = "YOUR_TELEGRAM_BOT_API_KEY"
+FORUM_API_KEY = "YOUR_FORUM_API_KEY"
+ALLOWED_USER_IDS = [YOUR_ALLOWED_USER_ID]
+TIMEZONE = pytz.timezone('Europe/Moscow')
+INTERVAL_OPTIONS = [36, 18, 12, 6]  # Доступные интервалы в часах
 
-# Настройка базы данных
-DB = connect('lzt_bot.db')
-DB.execute('''CREATE TABLE IF NOT EXISTS items
-             (user_id INT,
-              item_id TEXT UNIQUE,
-              interval INT,
-              last_bump INT)''')
+# Глобальные переменные
+topics = {}
+topics_lock = Lock()
+current_interval = 6  # Текущий интервал по умолчанию
+operation_paused = False  # Флаг приостановки операций
 
-# Инициализация бота
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=API_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+def check_access(user_id):
+    return user_id in ALLOWED_USER_IDS
 
-# Состояния
-class Form(StatesGroup):
-    set_interval = State()
-    change_interval = State()
-    delete_item = State()
+async def send_admin_alert(context: ContextTypes.DEFAULT_TYPE, message: str):
+    for admin_id in ALLOWED_USER_IDS:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=f" Уведомление: {message}"
+        )
 
-# Клавиатуры
-def main_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=" Добавить"), KeyboardButton(text=" Список")],
-            [KeyboardButton(text="⚙ Интервал"), KeyboardButton(text="❌ Удалить")]
-        ],
-        resize_keyboard=True
-    )
-
-def cancel_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=" Назад")]],
-        resize_keyboard=True
-    )
-
-def confirm_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✅ Да"), KeyboardButton(text="❌ Нет")]
-        ],
-        resize_keyboard=True
-    )
-
-def items_keyboard(items, prefix):
-    keyboard = []
-    for item in items:
-        keyboard.append([KeyboardButton(text=f"{prefix} {item[0]}")])
-    keyboard.append([KeyboardButton(text=" Назад")])
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-
-# Проверка пользователя
-async def check_user(user_id: int) -> bool:
-    return user_id == ALLOWED_USER_ID
-
-# Проверка возможности поднятия
-async def can_bump(item_id: str):
-    url = f"https://api.lzt.market/{item_id}/bump"
-    headers = {"Authorization": f"Bearer {LZT_API_KEY}"}
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, headers=headers) as response:
-                data = await response.json()
-                if response.status == 200:
-                    return True, "OK"
-                return False, data.get('errors', ['Неизвестная ошибка'])[0]
-        except Exception as e:
-            return False, str(e)
-
-# Автоподнятие
-async def scheduler():
-    while True:
-        await asyncio.sleep(60)
-        cursor = DB.execute("SELECT * FROM items")
-        for row in cursor.fetchall():
-            user_id, item_id, interval, last_bump = row
-            if (time.time() - last_bump) >= interval * 3600:
-                success, error = await can_bump(item_id)
-                new_bump = int(time.time()) if success else last_bump
-                DB.execute("UPDATE items SET last_bump = ? WHERE item_id = ?",
-                          (new_bump, item_id))
-                DB.commit()
-
-# Обработчики
-@dp.message(Command('start'))
-@dp.message(F.text == " Назад")
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    if not await check_user(message.from_user.id):
-        return
-    await message.answer("Главное меню:", reply_markup=main_menu())
-
-@dp.message(F.text == " Добавить")
-async def cmd_add(message: types.Message):
-    await message.answer("Отправьте ссылку на объявление:", reply_markup=cancel_keyboard())
-
-@dp.message(F.text.startswith('https://lzt.market/'))
-async def process_url(message: types.Message, state: FSMContext):
+def bump_topic(topic_id):
     try:
-        path = urlparse(message.text).path.split('/')
-        item_id = path[1]
-        
-        if not item_id.isdigit():
-            raise ValueError
-
-        cursor = DB.execute("SELECT 1 FROM items WHERE item_id = ?", (item_id,))
-        if cursor.fetchone():
-            await message.answer("⚠ Это объявление уже в списке!", reply_markup=main_menu())
-            return
-
-        success, error = await can_bump(item_id)
-        if not success:
-            await message.answer(f"❌ Невозможно добавить: {error}", reply_markup=main_menu())
-            return
-
-        await state.set_state(Form.set_interval)
-        await state.update_data(item_id=item_id)
-        await message.answer("✅ Аккаунт доступен! Введите интервал поднятия (часов, минимум 6):",
-                           reply_markup=cancel_keyboard())
-        
+        url = f"https://api.zelenka.guru/threads/{topic_id}/bump"
+        headers = {
+            "accept": "application/json",
+            "Authorization": f"Bearer {FORUM_API_KEY}"
+        }
+        response = requests.post(url, headers=headers, timeout=10)
+        return response.json()
     except Exception as e:
-        await message.answer("❌ Неверная ссылка!", reply_markup=main_menu())
+        logger.error(f"Сетевая ошибка: {str(e)}")
+        return {"errors": [f"Сетевая ошибка: {str(e)}"]}
 
-@dp.message(Form.set_interval)
-async def set_interval(message: types.Message, state: FSMContext):
-    if message.text == " Назад":
-        await state.clear()
-        return await cmd_start(message, state)
-    
-    try:
-        interval = max(6, int(message.text))
-        data = await state.get_data()
-        item_id = data['item_id']
-        
-        DB.execute("""INSERT OR REPLACE INTO items
-                    (user_id, item_id, interval, last_bump)
-                    VALUES (?, ?, ?, ?)""",
-                (message.from_user.id, item_id, interval, int(time.time())))
-        DB.commit()
-        
-        await message.answer(f"✅ Объявление {item_id} добавлено!", reply_markup=main_menu())
-        await state.clear()
-        
-    except ValueError:
-        await message.answer("❌ Введите число!", reply_markup=cancel_keyboard())
+async def show_main_menu(update: Update, message: str = "Выберите действие:"):
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить тему", callback_data='add_topic')],
+        [InlineKeyboardButton(" Удалить тему", callback_data='remove_topic')],
+        [InlineKeyboardButton(" Список тем", callback_data='list_topics')],
+        [InlineKeyboardButton("⏱ Изменить интервал", callback_data='change_interval')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if update.message:
+        await update.message.reply_text(message, reply_markup=reply_markup)
+    else:
+        await update.callback_query.message.reply_text(message, reply_markup=reply_markup)
 
-@dp.message(F.text == " Список")
-async def cmd_list(message: types.Message):
-    if not await check_user(message.from_user.id):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_access(update.message.from_user.id):
+        await update.message.reply_text(" Доступ запрещен!")
         return
-    
-    cursor = DB.execute("SELECT item_id, interval, last_bump FROM items WHERE user_id = ?",
-                       (message.from_user.id,))
-    items = cursor.fetchall()
-    
-    if not items:
-        return await message.answer(" Список объявлений пуст", reply_markup=main_menu())
-    
-    text = [" Ваши объявления:"]
-    for item in items:
-        last_bump = time.strftime('%d.%m.%Y %H:%M', time.localtime(item[2])) if item[2] > 0 else "никогда"
-        text.append(f"▪ ID: {item[0]}\nИнтервал: {item[1]}ч\nПоследнее поднятие: {last_bump}")
-    
-    await message.answer("\n".join(text), reply_markup=main_menu())
+    await show_main_menu(update)
 
-@dp.message(F.text == "⚙ Интервал")
-async def cmd_change_interval(message: types.Message, state: FSMContext):
-    if not await check_user(message.from_user.id):
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == 'add_topic':
+        await query.message.reply_text("Отправьте ссылку на тему или её ID:")
+        context.user_data['action'] = 'add_topic'
+
+    elif data == 'remove_topic':
+        with topics_lock:
+            if not topics:
+                await query.message.reply_text("Список тем пуст!")
+                await show_main_menu(update)
+                return
+          
+            keyboard = [
+                [InlineKeyboardButton(f"ID: {tid}", callback_data=f'del_{tid}')]
+                for tid in topics
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.reply_text("Выберите тему для удаления:", reply_markup=reply_markup)
+
+    elif data.startswith('del_'):
+        topic_id = data.split('_')[1]
+        with topics_lock:
+            if topic_id in topics:
+                del topics[topic_id]
+                await query.message.reply_text(f"✅ Тема {topic_id} удалена!")
+            else:
+                await query.message.reply_text("❌ Тема не найдена!")
+        await show_main_menu(update)
+
+    elif data == 'list_topics':
+        with topics_lock:
+            if not topics:
+                await query.message.reply_text(" Список тем пуст!")
+                await show_main_menu(update)
+                return
+          
+            message = " Активные темы:\n\n"
+            for tid, data in topics.items():
+                next_time = data['next_bump_time'].astimezone(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+                message += f" ID: {tid}\n⏰ Следующее поднятие: {next_time}\n\n"
+          
+            await query.message.reply_text(message)
+            await show_main_menu(update)
+
+    elif data == 'change_interval':
+        keyboard = [
+            [InlineKeyboardButton(f"{h} часов", callback_data=f'interval_{h}')]
+            for h in INTERVAL_OPTIONS
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            "Выберите новый интервал для всех тем:",
+            reply_markup=reply_markup
+        )
+
+    elif data.startswith('interval_'):
+        global current_interval, operation_paused
+        new_interval = int(data.split('_')[1])
+        operation_paused = True
+      
+        with topics_lock:
+            current_interval = new_interval
+            now = datetime.now(TIMEZONE)
+            for topic_id in topics:
+                topics[topic_id]['next_bump_time'] = now + timedelta(hours=new_interval)
+                topics[topic_id]['interval_hours'] = new_interval
+          
+            operation_paused = False
+            await query.message.reply_text(
+                f"✅ Интервал для всех тем изменен на {new_interval} часов!\n"
+                "Следующее поднятие через указанный интервал."
+            )
+        await show_main_menu(update)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_access(update.message.from_user.id):
         return
-    
-    cursor = DB.execute("SELECT item_id, interval FROM items WHERE user_id = ?",
-                      (message.from_user.id,))
-    items = cursor.fetchall()
-    
-    if not items:
-        return await message.answer("❌ Нет объявлений для изменения", reply_markup=main_menu())
-    
-    await message.answer("Выберите объявление:", reply_markup=items_keyboard(items, ""))
-    await state.set_state(Form.change_interval)
 
-@dp.message(Form.change_interval, F.text == " Назад")
-async def cancel_change_interval(message: types.Message, state: FSMContext):
-    await state.clear()
-    await cmd_start(message, state)
+    text = update.message.text.strip()
+    user_data = context.user_data.get('action')
 
-@dp.message(Form.change_interval, F.text.startswith(""))
-async def select_item(message: types.Message, state: FSMContext):
-    try:
-        item_id = message.text.split()[1]
-        await state.update_data(item_id=item_id)
-        await message.answer("Введите новый интервал:", reply_markup=cancel_keyboard())
-        await state.set_state(Form.set_interval)
-    except:
-        await message.answer("❌ Ошибка выбора", reply_markup=main_menu())
-        await state.clear()
+    if user_data == 'add_topic':
+        try:
+            original_input = text
+            match = re.search(r'\d+', text)
+            if not match:
+                raise ValueError("Некорректный формат")
+            topic_id = match.group(0)
+          
+            with topics_lock:
+                if topic_id in topics:
+                    next_time = topics[topic_id]['next_bump_time'].astimezone(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+                    await update.message.reply_text(
+                        f"⚠ Тема {topic_id} уже есть в списке!\n"
+                        f"Следующее поднятие: {next_time}"
+                    )
+                    context.user_data.pop('action')
+                    await show_main_menu(update)
+                    return
 
-@dp.message(F.text == "❌ Удалить")
-async def cmd_delete(message: types.Message, state: FSMContext):
-    if not await check_user(message.from_user.id):
-        return
-    
-    cursor = DB.execute("SELECT item_id FROM items WHERE user_id = ?",
-                      (message.from_user.id,))
-    items = cursor.fetchall()
-    
-    if not items:
-        return await message.answer("❌ Нет объявлений для удаления", reply_markup=main_menu())
-    
-    await message.answer("Выберите объявление:", reply_markup=items_keyboard(items, ""))
-    await state.set_state(Form.delete_item)
+                response = bump_topic(topic_id)
+                now = datetime.now(TIMEZONE)
 
-@dp.message(Form.delete_item, F.text.startswith(""))
-async def select_delete_item(message: types.Message, state: FSMContext):
-    try:
-        item_id = message.text.split()[1]
-        await state.update_data(item_id=item_id)
-        await message.answer(f"Удалить объявление {item_id}?", reply_markup=confirm_keyboard())
-    except:
-        await message.answer("❌ Ошибка выбора", reply_markup=main_menu())
-        await state.clear()
+                topics[topic_id] = {
+                    'next_bump_time': now + timedelta(hours=current_interval),
+                    'interval_hours': current_interval,
+                    'original_input': original_input
+                }
+              
+                next_time = topics[topic_id]['next_bump_time'].strftime("%d.%m.%Y %H:%M")
+                await update.message.reply_text(
+                    f"✅ Тема {topic_id} успешно добавлена!\n"
+                    f"Следующее поднятие: {next_time}"
+                )
+              
+                context.user_data.pop('action')
+                await show_main_menu(update)
 
-@dp.message(Form.delete_item, F.text == "✅ Да")
-async def confirm_delete(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    DB.execute("DELETE FROM items WHERE item_id = ? AND user_id = ?",
-             (data['item_id'], message.from_user.id))
-    DB.commit()
-    await message.answer(f"✅ Объявление {data['item_id']} удалено!", reply_markup=main_menu())
-    await state.clear()
+        except Exception as e:
+            await update.message.reply_text("❌ Ошибка! Убедитесь что отправили правильную ссылку или ID темы")
+            context.user_data.pop('action', None)
+            await show_main_menu(update)
 
-@dp.message(Form.delete_item, F.text == "❌ Нет")
-async def cancel_delete(message: types.Message, state: FSMContext):
-    await state.clear()
-    await cmd_start(message, state)
+def start_bumping(application):
+    while True:
+        if not operation_paused:
+            now = datetime.now(TIMEZONE)
+            with topics_lock:
+                for topic_id, data in list(topics.items()):
+                    if now >= data['next_bump_time'] and not operation_paused:
+                        response = bump_topic(topic_id)
+                        new_time = now + timedelta(hours=data['interval_hours'])
+                      
+                        if "errors" in response:
+                            error = "\n".join(response["errors"])
+                            application.bot.send_message(
+                                chat_id=ALLOWED_USER_IDS[0],
+                                text=f"❌ Ошибка в теме {topic_id}:\n{error}"
+                            )
+                        else:
+                            topics[topic_id]['next_bump_time'] = new_time
+                            application.bot.send_message(
+                                chat_id=ALLOWED_USER_IDS[0],
+                                text=f"✅ Тема {topic_id} поднята!\nСледующее: {new_time.strftime('%d.%m.%Y %H:%M')}"
+                            )
+        time.sleep(60)
 
-# Запуск
-async def on_startup():
-    asyncio.create_task(scheduler())
+if __name__ == "__main__":
+    application = Application.builder().token(API_KEY).build()
 
-if __name__ == '__main__':
-    dp.startup.register(on_startup)
-    dp.run_polling(bot)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_button))
+    application.add_handler(MessageHandler(filters.TEXT, handle_message))
+
+    bump_thread = Thread(target=start_bumping, args=(application,))
+    bump_thread.daemon = True
+    bump_thread.start()
+
+    application.run_polling()
